@@ -353,66 +353,126 @@ upgrade_smart_dns() {
 # Add sites
 add_sites() {
     config_file="/root/smartSNI/config.json"
+    temp_file="/root/smartSNI/temp_config.json"
 
-    if [ -d "/root/smartSNI" ]; then
-        echo -e "${yellow}********************${rest}"
-        read -p "Enter additional Websites (separated by commas):" additional_sites
-        IFS=',' read -ra new_sites <<< "$additional_sites"
-
-        current_domains=$(jq -r '.domains | keys_unsorted | .[]' "$config_file")
-        for site in "${new_sites[@]}"; do
-            if [[ ! " ${current_domains[@]} " =~ " $site " ]]; then
-                jq ".domains += {\"$site\": \"$myip\"}" "$config_file" > temp_config.json
-                mv temp_config.json "$config_file"
-                echo -e "${yellow}********************${rest}"
-                echo -e "${green}Domain ${cyan}'$site'${green} added successfully.${rest}"
-            else
-                echo -e "${yellow}Domain ${cyan}'$site' already exists.${rest}"
-            fi
-        done
-
-        # Restart the service
-        systemctl restart sni.service
-    else
-        echo -e "${yellow}********************${rest}"
+    if [ ! -f "$config_file" ]; then
         echo -e "${red}Not installed. Please Install first.${rest}"
+        return
     fi
+
+    echo -e "${yellow}********************${rest}"
+    read -p "Enter additional Websites (separated by commas): " additional_sites
+    IFS=',' read -ra new_sites <<< "$additional_sites"
+
+    myip=$(hostname -I | awk '{print $1}')
+    added=0
+    for site in "${new_sites[@]}"; do
+        site=$(echo "$site" | xargs)
+        [ -z "$site" ] && continue
+        if ! jq -e --arg k "$site" '.domains | has($k)' "$config_file" > /dev/null 2>&1; then
+            if jq ".domains += {\"$site\": \"$myip\"}" "$config_file" > "$temp_file" 2>/dev/null; then
+                mv "$temp_file" "$config_file"
+                echo -e "${green}  + ${cyan}$site${rest}"
+                added=$((added + 1))
+            else
+                echo -e "${red}  Failed to add: $site${rest}"
+            fi
+        else
+            echo -e "${yellow}  = $site (already exists)${rest}"
+        fi
+    done
+
+    if [ "$added" -eq 0 ]; then
+        echo -e "${yellow}No new sites to add.${rest}"
+        return
+    fi
+
+    echo -e "${yellow}Applying changes...${rest}"
+    ensure_port_53_available
+    systemctl stop sni.service 2>/dev/null
+    sleep 2
+    systemctl start sni.service
+    sleep 2
+
+    if systemctl is-active --quiet sni.service; then
+        echo -e "${green}Done. $added site(s) added and service is running.${rest}"
+    else
+        echo -e "${red}Service did not start. Trying fix...${rest}"
+        ensure_port_53_available
+        sleep 1
+        systemctl start sni.service
+        sleep 2
+        if systemctl is-active --quiet sni.service; then
+            echo -e "${green}Service is running now.${rest}"
+        else
+            echo -e "${red}Still failed. Check: journalctl -u sni.service -n 30${rest}"
+        fi
+    fi
+    echo -e "${yellow}********************${rest}"
 }
 
 # Remove sites
 remove_sites() {
     config_file="/root/smartSNI/config.json"
+    temp_file="/root/smartSNI/temp_config.json"
 
-    if [ -d "/root/smartSNI" ]; then
-        # Display available sites
-        display_sites
-        
-        read -p "Enter Websites names to remove (separated by commas): " domains_to_remove
-        IFS=',' read -ra selected_domains <<< "$domains_to_remove"
-
-        # Remove selected domains from JSON
-        for selected_domain in "${selected_domains[@]}"; do
-            if jq -e --arg selected_domain "$selected_domain" '.domains | has($selected_domain)' "$config_file" > /dev/null; then
-                jq "del(.domains[\"$selected_domain\"])" "$config_file" > temp_config.json
-                mv temp_config.json "$config_file"
-                echo -e "${yellow}********************${rest}"
-                echo -e "${green}Domain ${cyan}'$selected_domain'${green} removed successfully.${rest}"
-            else
-                echo -e "${yellow}********************${rest}"
-                echo -e "${yellow}Domain ${cyan}'$selected_domain'${yellow} not found.${rest}"
-            fi
-        done
-
-        # Restart the service
-        systemctl restart sni.service
-    else
-        echo -e "${yellow}********************${rest}"
+    if [ ! -f "$config_file" ]; then
         echo -e "${red}Not installed. Please Install first.${rest}"
+        return
     fi
+
+    display_sites
+    read -p "Enter Websites names to remove (separated by commas): " domains_to_remove
+    IFS=',' read -ra selected_domains <<< "$domains_to_remove"
+
+    removed=0
+    for selected_domain in "${selected_domains[@]}"; do
+        selected_domain=$(echo "$selected_domain" | xargs)
+        [ -z "$selected_domain" ] && continue
+        if jq -e --arg d "$selected_domain" '.domains | has($d)' "$config_file" > /dev/null; then
+            if jq "del(.domains[\"$selected_domain\"])" "$config_file" > "$temp_file" 2>/dev/null; then
+                mv "$temp_file" "$config_file"
+                echo -e "${green}  - ${cyan}$selected_domain${rest} removed"
+                removed=$((removed + 1))
+            else
+                echo -e "${red}  Failed to remove: $selected_domain${rest}"
+            fi
+        else
+            echo -e "${yellow}  $selected_domain not in list${rest}"
+        fi
+    done
+
+    if [ "$removed" -eq 0 ]; then
+        echo -e "${yellow}Nothing removed.${rest}"
+        return
+    fi
+
+    echo -e "${yellow}Applying changes...${rest}"
+    ensure_port_53_available
+    systemctl stop sni.service 2>/dev/null
+    sleep 2
+    systemctl start sni.service
+    sleep 2
+
+    if systemctl is-active --quiet sni.service; then
+        echo -e "${green}Done. $removed site(s) removed and service is running.${rest}"
+    else
+        echo -e "${red}Service did not start. Trying fix...${rest}"
+        ensure_port_53_available
+        sleep 1
+        systemctl start sni.service
+        sleep 2
+        if systemctl is-active --quiet sni.service; then
+            echo -e "${green}Service is running now.${rest}"
+        else
+            echo -e "${red}Still failed. Check: journalctl -u sni.service -n 30${rest}"
+        fi
+    fi
+    echo -e "${yellow}********************${rest}"
 }
 
 clear
-echo -e "${cyan}By --> Peyman * Github.com/amir * ${rest}"
+echo -e "${cyan}By --> Peyman1 * Github.com/amir * ${rest}"
 echo ""
 check
 echo -e "${purple}*******************${rest}"
