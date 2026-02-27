@@ -391,7 +391,7 @@ remove_sites() {
 }
 
 clear
-echo -e "${cyan}By --> Peyman * Github.com/Ptechgithub * ${rest}"
+echo -e "${cyan}By --> Peyman * Github.com/amir * ${rest}"
 echo ""
 check
 echo -e "${purple}*******************${rest}"
