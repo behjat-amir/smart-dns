@@ -76,6 +76,30 @@ open_firewall_ports() {
     echo -e "${green}No firewall (ufw/firewalld/iptables) detected.${rest}"
 }
 
+# Free port 53 if systemd-resolved (or similar) is using it
+ensure_port_53_available() {
+    if ! ss -ulnp 2>/dev/null | grep -q ':53 ' && ! ss -tlnp 2>/dev/null | grep -q ':53 '; then
+        return 0
+    fi
+    echo -e "${yellow}Port 53 is in use. Checking systemd-resolved...${rest}"
+    if [ ! -f /etc/systemd/resolved.conf ]; then
+        echo -e "${yellow}Port 53 in use but no /etc/systemd/resolved.conf. Stop the process using port 53 manually.${rest}"
+        return 0
+    fi
+    if grep -q '^DNSStubListener=no' /etc/systemd/resolved.conf 2>/dev/null; then
+        echo -e "${green}DNSStubListener already disabled.${rest}"
+        return 0
+    fi
+    echo -e "${yellow}Disabling DNS stub listener so smartSNI can use port 53.${rest}"
+    sed -i 's/^#*DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf
+    if ! grep -q '^DNSStubListener=' /etc/systemd/resolved.conf; then
+        echo 'DNSStubListener=no' >> /etc/systemd/resolved.conf
+    fi
+    systemctl restart systemd-resolved 2>/dev/null || true
+    sleep 1
+    echo -e "${green}Port 53 should now be free.${rest}"
+}
+
 # Install necessary packages
 install_dependencies() {
     detect_distribution
@@ -213,6 +237,9 @@ Restart=always
 WantedBy=default.target
 EOL
 
+        # Free port 53 if systemd-resolved (or similar) is using it
+        ensure_port_53_available
+
         # Reload systemd, enable and start the service
         systemctl daemon-reload
         systemctl enable sni.service
@@ -282,6 +309,23 @@ check() {
         echo -e "${cyan}[Service Actived]${rest}"
     else
         echo -e "${yellow}[Service Not Active]${rest}"
+    fi
+}
+
+# Fix port 53 in use (e.g. systemd-resolved) and restart sni
+fix_port_53_and_restart() {
+    if [ ! -f "/etc/systemd/system/sni.service" ]; then
+        echo -e "${red}smartSNI is not installed. Install first.${rest}"
+        return
+    fi
+    echo -e "${yellow}Freeing port 53 and restarting sni.service...${rest}"
+    ensure_port_53_available
+    systemctl restart sni.service
+    sleep 1
+    if systemctl is-active --quiet sni.service; then
+        echo -e "${green}sni.service is now running.${rest}"
+    else
+        echo -e "${red}sni.service still not active. Check: journalctl -u sni.service -n 30${rest}"
     fi
 }
 
@@ -363,6 +407,8 @@ echo -e "${yellow}4] ${green}Add Sites${rest}      ${purple}*"
 echo -e "${purple}                  * "
 echo -e "${yellow}5] ${green}Remove Sites${rest}   ${purple}*"
 echo -e "${purple}                  * "
+echo -e "${yellow}6] ${green}Fix port 53 & restart${rest} ${purple}*"
+echo -e "${purple}                  * "
 echo -e "${red}0${yellow}] ${purple}Exit${rest}${purple}           *"
 echo -e "${purple}*******************${rest}"
 read -p "Enter your choice: " choice
@@ -381,6 +427,9 @@ case "$choice" in
         ;;
     5)
         remove_sites
+        ;;
+    6)
+        fix_port_53_and_restart
         ;;
     0)
         echo -e "${cyan}By 🖐${rest}"
