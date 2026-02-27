@@ -207,12 +207,28 @@ install() {
         echo "$json_content" | jq '.' > /root/smartSNI/config.json
 
         nginx_conf="/etc/nginx/sites-enabled/default"
-        sed -i "s/server_name _;/server_name $domain;/g" "$nginx_conf"
-        sed -i "s/<YOUR_HOST>/$domain/g" /root/smartSNI/nginx.conf
+        # Minimal HTTP-only config so nginx -t passes and certbot can get the cert.
+        # (If default already had SSL with missing cert from a previous run, certbot would fail.)
+        cat > "$nginx_conf" <<NGINX_MINIMAL
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name $domain;
+    root /var/www/html;
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+NGINX_MINIMAL
+        nginx -t || true
+        systemctl restart nginx || true
+        sleep 1
 
-        # Obtain SSL certificates
+        # Obtain SSL certificates (certbot will add SSL to the minimal config)
         certbot --nginx -d $domain --register-unsafely-without-email --non-interactive --agree-tos --redirect
 
+        # Now replace with full smartSNI nginx config (cert exists now)
+        sed -i "s/<YOUR_HOST>/$domain/g" /root/smartSNI/nginx.conf
         sudo cp /root/smartSNI/nginx.conf "$nginx_conf"
         systemctl stop nginx
         systemctl restart nginx
