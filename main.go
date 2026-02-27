@@ -391,7 +391,7 @@ func handleConnection(clientConn net.Conn) {
 	}
 
 	target := sni
-	if target == strings.ToLower(config.Host) {
+	if config.Host != "" && target == strings.ToLower(config.Host) {
 		target = "127.0.0.1:8443"
 	} else {
 		target = net.JoinHostPort(target, "443")
@@ -631,18 +631,25 @@ func main() {
 	// Shared rate limiter for DoH/DoT (50 req/s, burst 100)
 	limiter = rate.NewLimiter(rate.Limit(50), 100)
 
-	log.Println("Starting smartSNI on :53 (DNS), :443 (SNI), :853 (DoT), 127.0.0.1:8080 (DoH)")
+	useDoHDoT := config.Host != ""
+	if useDoHDoT {
+		log.Println("Starting smartSNI on :53 (DNS), :443 (SNI), :853 (DoT), 127.0.0.1:8080 (DoH)")
+	} else {
+		log.Println("Starting smartSNI on :53 (DNS), :443 (SNI) — no DoH/DoT (host not set)")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	var wg sync.WaitGroup
-	wg.Add(4)
-
+	wg.Add(2) // Classic DNS + SNI proxy always
 	go runClassicDNSServer(ctx, &wg)
-	go runDOHServer(ctx, &wg)
-	go startDoTServer(ctx, &wg)
 	go serveSniProxy(ctx, &wg)
+	if useDoHDoT {
+		wg.Add(2)
+		go runDOHServer(ctx, &wg)
+		go startDoTServer(ctx, &wg)
+	}
 
 	wg.Wait()
 	log.Println("Shutdown complete")

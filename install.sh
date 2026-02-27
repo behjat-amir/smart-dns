@@ -183,7 +183,8 @@ install() {
         sleep 1
         clear
         echo -e "${yellow}********************${rest}"
-        read -p "Enter your domain: " domain
+        read -p "Enter your domain (or press Enter to skip DoH/DoT — use only system DNS + SNI proxy): " domain
+        domain=$(echo "$domain" | xargs)
         echo -e "${yellow}********************${rest}"
         read -p "Enter Website names (separated by commas)[example: intel.com,youtube]: " site_list
         echo -e "${yellow}********************${rest}"
@@ -200,27 +201,40 @@ install() {
         done
         new_domains+="}"
         
-        # Create a JSON Object with host and domains
+        # Create a JSON Object with host and domains (host empty = no DoH/DoT)
         json_content="{ \"host\": \"$domain\", \"domains\": $new_domains }"
         
         # Save JSON to config.json file
         echo "$json_content" | jq '.' > /root/smartSNI/config.json
 
-        nginx_conf="/etc/nginx/sites-enabled/default"
-        sed -i "s/server_name _;/server_name $domain;/g" "$nginx_conf"
-        sed -i "s/<YOUR_HOST>/$domain/g" /root/smartSNI/nginx.conf
-
-        # Obtain SSL certificates
-        certbot --nginx -d $domain --register-unsafely-without-email --non-interactive --agree-tos --redirect
-
-        sudo cp /root/smartSNI/nginx.conf "$nginx_conf"
-        systemctl stop nginx
-        systemctl restart nginx
-
         config_file="/root/smartSNI/config.json"
-
-        sed -i "s/<YOUR_HOST>/$domain/g" "$config_file"
         sed -i "s/<YOUR_IP>/$myip/g" "$config_file"
+
+        if [ -n "$domain" ]; then
+            nginx_conf="/etc/nginx/sites-enabled/default"
+            # Minimal HTTP-only config so nginx -t passes and certbot can get the cert
+            cat > "$nginx_conf" <<NGINX_MINIMAL
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name $domain;
+    root /var/www/html;
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+NGINX_MINIMAL
+            nginx -t || true
+            systemctl restart nginx || true
+            sleep 1
+            certbot --nginx -d $domain --register-unsafely-without-email --non-interactive --agree-tos --redirect
+            sed -i "s/<YOUR_HOST>/$domain/g" /root/smartSNI/nginx.conf
+            sudo cp /root/smartSNI/nginx.conf "$nginx_conf"
+            systemctl stop nginx
+            systemctl restart nginx
+        else
+            echo -e "${green}DoH/DoT skipped (no domain). Only system DNS and SNI proxy will run.${rest}"
+        fi
         
         # Create systemd service file (runs compiled binary, no Go needed at runtime)
         cat > /etc/systemd/system/sni.service <<EOL
@@ -251,8 +265,22 @@ EOL
             echo -e "${green}Service Installed Successfully and activated.${rest}"
             echo -e "${yellow}_______________________________________${rest}"
             echo ""
-            echo -e "${cyan}DOH --> https://$domain/dns-query${rest}"
+            if [ -n "$domain" ]; then
+                echo -e "${cyan}DOH --> https://$domain:8443/dns-query${rest}"
+            else
+                echo -e "${cyan}System DNS (port 53) + SNI proxy (443) active. Set this server IP as your DNS.${rest}"
+            fi
             echo -e "${yellow}_______________________________________${rest}"
+            # Offer to install smart-dns command for next time
+            if [ ! -x /usr/local/bin/smart-dns ]; then
+                echo ""
+                read -p "Install 'smart-dns' command so you can open this menu anytime without curl? (y/n): " install_cmd
+                if [[ "$install_cmd" =~ ^[yY] ]]; then
+                    printf '%s\n' '#!/bin/bash' "exec bash /root/smartSNI/install.sh \"\$@\"" > /usr/local/bin/smart-dns
+                    chmod +x /usr/local/bin/smart-dns
+                    echo -e "${green}Done. Next time just run: ${cyan}smart-dns${rest}"
+                fi
+            fi
         else
             echo -e "${yellow}____________________________${rest}"
             echo -e "${red}Service is not active.${rest}"
@@ -274,7 +302,8 @@ uninstall() {
     sudo systemctl disable sni.service 2>/dev/null
 
     # Remove service file
-    sudo rm /etc/systemd/system/sni.service
+    sudo rm -f /etc/systemd/system/sni.service
+    rm -f /usr/local/bin/smart-dns 2>/dev/null
     rm -rf /root/smartSNI
     rm -rf /root/go
     echo -e "${yellow}____________________________________${rest}"
@@ -326,6 +355,32 @@ fix_port_53_and_restart() {
         echo -e "${green}sni.service is now running.${rest}"
     else
         echo -e "${red}sni.service still not active. Check: journalctl -u sni.service -n 30${rest}"
+    fi
+}
+
+# Upgrade: pull latest source, rebuild, restart
+upgrade_smart_dns() {
+    if [ ! -d "/root/smartSNI" ] || [ ! -f "/root/smartSNI/main.go" ]; then
+        echo -e "${red}smartSNI is not installed. Install first.${rest}"
+        return
+    fi
+    echo -e "${yellow}Upgrading smartSNI (git pull + build + restart)...${rest}"
+    setup_go_env
+    cd /root/smartSNI || return 1
+    if ! git pull --rebase 2>/dev/null && ! git pull 2>/dev/null; then
+        echo -e "${yellow}Could not git pull (no repo or network). Continuing with build...${rest}"
+    fi
+    go mod download && go mod tidy && go build -o smartSNI .
+    if [ $? -ne 0 ]; then
+        echo -e "${red}Build failed.${rest}"
+        return 1
+    fi
+    systemctl restart sni.service
+    sleep 1
+    if systemctl is-active --quiet sni.service; then
+        echo -e "${green}Upgrade done. sni.service restarted.${rest}"
+    else
+        echo -e "${red}Build OK but sni.service not active. Check: journalctl -u sni.service -n 30${rest}"
     fi
 }
 
@@ -409,6 +464,8 @@ echo -e "${yellow}5] ${green}Remove Sites${rest}   ${purple}*"
 echo -e "${purple}                  * "
 echo -e "${yellow}6] ${green}Fix port 53 & restart${rest} ${purple}*"
 echo -e "${purple}                  * "
+echo -e "${yellow}7] ${green}Upgrade${rest} (pull + rebuild + restart) ${purple}*"
+echo -e "${purple}                  * "
 echo -e "${red}0${yellow}] ${purple}Exit${rest}${purple}           *"
 echo -e "${purple}*******************${rest}"
 read -p "Enter your choice: " choice
@@ -430,6 +487,9 @@ case "$choice" in
         ;;
     6)
         fix_port_53_and_restart
+        ;;
+    7)
+        upgrade_smart_dns
         ;;
     0)
         echo -e "${cyan}By 🖐${rest}"
