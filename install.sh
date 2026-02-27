@@ -128,7 +128,7 @@ install() {
     else
         install_dependencies
         open_firewall_ports
-        git clone https://github.com/Ptechgithub/smartSNI.git /root/smartSNI
+        git clone https://github.com/behjat-amir/smart-dns.git /root/smartSNI
          
         sleep 1
         clear
