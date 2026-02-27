@@ -96,6 +96,7 @@ install_dependencies() {
     else
         echo -e "${green}go is already installed.${rest}"
     fi
+    setup_go_env
 }
 
 # Install Go
@@ -106,15 +107,28 @@ install_go() {
     
     if [[ $ARCH == "amd64" || $ARCH == "arm64" ]]; then
         wget https://go.dev/dl/go1.21.1.linux-"$ARCH".tar.gz
-        rm -rf /usr/local/go && rm -rf /usr/local/bin/go && tar -C /usr/local -xzf go1.21.1.linux-"$ARCH".tar.gz
-        export PATH=$PATH:/usr/local/go/bin
-        cp /usr/local/go/bin/go /usr/local/bin
+        rm -rf /usr/local/go && rm -f /usr/local/bin/go && tar -C /usr/local -xzf go1.21.1.linux-"$ARCH".tar.gz
+        export GOROOT=/usr/local/go
+        export PATH=$GOROOT/bin:$PATH
+        ln -sf /usr/local/go/bin/go /usr/local/bin/go 2>/dev/null || true
         
-        rm go1.21.1.linux-"$ARCH".tar.gz
+        rm -f go1.21.1.linux-"$ARCH".tar.gz
         rm -rf /root/go
         echo -e "${cyan}Go has been installed.${rest}"
     else
         echo -e "${red}Unsupported architecture: $ARCH${rest}"
+        exit 1
+    fi
+}
+
+# Ensure Go env is set (GOROOT/PATH) so "go" works even if only binary was copied
+setup_go_env() {
+    if [ -d /usr/local/go ]; then
+        export GOROOT=/usr/local/go
+        export PATH=$GOROOT/bin:$PATH
+    fi
+    if ! command -v go &> /dev/null; then
+        echo -e "${red}Go not found. Install Go first.${rest}"
         exit 1
     fi
 }
@@ -130,6 +144,18 @@ install() {
         open_firewall_ports
         git clone https://github.com/behjat-amir/smart-dns.git /root/smartSNI
          
+        sleep 1
+        setup_go_env
+        cd /root/smartSNI || exit 1
+        echo -e "${yellow}Downloading Go modules and building...${rest}"
+        go mod download && go mod tidy && go build -o smartSNI .
+        if [ $? -ne 0 ]; then
+            echo -e "${red}Build failed. Check errors above.${rest}"
+            exit 1
+        fi
+        echo -e "${green}Build successful.${rest}"
+        cd - > /dev/null || true
+
         sleep 1
         clear
         echo -e "${yellow}********************${rest}"
@@ -172,7 +198,7 @@ install() {
         sed -i "s/<YOUR_HOST>/$domain/g" "$config_file"
         sed -i "s/<YOUR_IP>/$myip/g" "$config_file"
         
-        # Create systemd service file
+        # Create systemd service file (runs compiled binary, no Go needed at runtime)
         cat > /etc/systemd/system/sni.service <<EOL
 [Unit]
 Description=Smart SNI Service
@@ -180,7 +206,7 @@ Description=Smart SNI Service
 [Service]
 User=root
 WorkingDirectory=/root/smartSNI
-ExecStart=/usr/local/go/bin/go run /root/smartSNI/main.go
+ExecStart=/root/smartSNI/smartSNI
 Restart=always
 
 [Install]
