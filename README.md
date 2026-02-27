@@ -1,94 +1,92 @@
 # Smart SNI and DNS Proxy Server
 
-This DNS Proxy Server is a Go-based server capable of handling **plain DNS (port 53)**, DNS-over-HTTPS (DoH), and DNS-over-TLS (DoT) requests. It features rate limiting and can process DNS queries based on a custom JSON configuration file. You can use it like **shecan.ir**: set the server IP as your system DNS and it works without configuring the browser.
+Go-based server: **plain DNS (port 53)** and **SNI proxy (443)**. Optionally DNS-over-HTTPS (DoH) and DNS-over-TLS (DoT). Use like **shecan.ir**: set the server IP as system DNS.
 
 ## Features
 
-- **Classic DNS (port 53):** UDP and TCP on port 53 so you can set this server's IP as **system DNS** (Windows, Linux, Mac, router). Works like shecan.ir — no browser/DoH setup needed.
-- **DNS-over-HTTPS (DoH):** Accepts and processes DNS queries over HTTPS.
-- **DNS-over-TLS (DoT):** Accepts and processes DNS queries over TLS.
-- **Rate Limiting:** Throttles the number of requests using a limiter.
-- **Custom Domain Handling:** Matches DNS queries to a list of specified domains and returns corresponding IP addresses.
-- **SNI Proxy:** Proxies non-matching domains to their respective addresses.
-- **Configurable:** Uses a `config.json` file to define behavior for specified domains.
+- **Classic DNS (port 53):** Set this server's IP as **system DNS** (Windows, Linux, Mac, router). No browser config.
+- **SNI Proxy (443):** Proxies HTTPS by SNI for the domains you list.
+- **DoH / DoT:** Optional; only if `host` is set in config and nginx/certs are configured.
+- **Rate limiting** and configurable domain list via `config.json`.
+
+## Project structure
+
+```
+smart-dns/
+├── main.go              # Application entry and all services
+├── go.mod / go.sum      # Go modules
+├── config.example.json  # Example config (copy to config.json)
+├── nginx.conf           # Used only when DoH is enabled (host set)
+├── install.sh           # Install menu (clone, build, systemd, smart-dns command)
+└── README.md
+```
 
 ## Configuration
 
-The server uses a `config.json` file which should be structured as follows:
+Copy the example and set your server IP:
+
+```bash
+cp config.example.json config.json
+```
+
+Edit `config.json`:
+
+- **`host`:** Leave `""` for **system DNS + SNI only** (no DoH/DoT). Set to your domain only if you want DoH/DoT and will configure nginx + certbot.
+- **`domains`:** List of domains to proxy; value is your server’s public IP.
+
+Example (DNS + SNI only):
 
 ```json
 {
-  "host": "your.host.com",
+  "host": "",
   "domains": {
     "example.com": "1.2.3.4",
-    "anotherdomain.com": "1.2.3.4"
+    "pub.dev": "1.2.3.4"
   }
 }
 ```
 
-Replace the IP addresses with your server's public IP to ensure transparent proxying(Here it's 1.2.3.4).\
-\
-**Using as system DNS (like shecan.ir):** After running the server, set your **server's IP** as the DNS in your OS (Windows: adapter DNS, Linux: resolv.conf or NetworkManager). No browser or DoH configuration needed. On Linux, port 53 usually requires root or: `sudo setcap 'cap_net_bind_service=+ep' ./smartSNI`\
-\
-You can use this code to proxy all domains(its not recommended)
+Replace `1.2.3.4` with your server’s public IP.
 
-```json
-{
-  "host": "your.host.com",
-  "domains": {
-    ".": "1.2.3.4"
-  }
-}
-```
+**Using as system DNS:** After the server is running, set your **server’s IP** as DNS in the OS (Windows: adapter DNS, Linux: resolv.conf or NetworkManager).
 
-## TLS Certificates
+## Auto install
 
-The DoT and DOH servers expect TLS certificates to be located at `/etc/letsencrypt/live/your.host.com/`. Make sure you have valid certificates named `fullchain.pem` and `privkey.pem`.\
-\
-You can obtain a valid certificate for your domain with lets encrypt
+One-liner (run once):
 
-
-## Auto Install
-
-```
+```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/behjat-amir/smart-dns/main/install.sh)
 ```
-![19](https://raw.githubusercontent.com/Ptechgithub/configs/main/media/19.jpg)
 
-## Manual Setup
+- Choose **1) Install**. You only enter **website names** (e.g. `pub.dev,youtube.com`). No domain needed for DNS + SNI.
+- After install you can install the **`smart-dns`** command so you don’t need curl again.
 
-1. Install Requirements
-```bash
-apt update
-apt install nginx certbot python3-certbot-nginx
-snap install go --classic
-```
-2. Change server_name in /etc/nginx/sites-enabled/default to your `domain`
-3. Obtain a valid certificate for nginx
-```bash
-certbot --nginx -d <YOUR_DOMAIN>
-```
-4. Clone the repository to your local machine.
-5. Create and configure your `config.json` file.
-6. Run `go build` to compile the server.
-7. Run the compiled binary to start the server in tmux or in background with nohup.
+Next time on the server, run:
 
 ```bash
-./name-of-compiled-binary
+smart-dns
 ```
 
-## Rate Limiting
+Menu options: Install, Uninstall, Show/Add/Remove sites, Fix port 53, **Upgrade** (git pull + rebuild + restart).
 
-The server uses the `golang.org/x/time/rate` package to implement rate limiting. You can adjust the rate limiter in the `main` function to suit your needs.
+## Manual setup
 
-## Contributions
+1. Install: `nginx`, `certbot`, `go` (and optionally `python3-certbot-nginx` if using DoH).
+2. Clone the repo, then:
+   ```bash
+   cp config.example.json config.json
+   # Edit config.json: set your server IP in "domains", leave "host" as "" for DNS+SNI only
+   go mod download && go mod tidy && go build -o smartSNI .
+   ```
+3. On Linux, port 53 usually needs: `sudo setcap 'cap_net_bind_service=+ep' ./smartSNI` or run as root.
+4. Run: `./smartSNI` (or run via systemd; see `install.sh` for an example unit).
 
-Contributions to this project are welcome. Please fork the repository, make your changes, and submit a pull request.
+If you set `host` and want DoH: configure nginx with SSL for that host and proxy `/dns-query` to `127.0.0.1:8080`. DoT uses certs under `/etc/letsencrypt/live/<host>/`.
 
-## Credits
+## Rate limiting
 
-Special thanks to [Peyman](https://github.com/Ptechgithub) for auto install script
+The server uses `golang.org/x/time/rate` (e.g. 50 req/s, burst 100). Adjust in `main.go` if needed.
 
 ## License
 
-This project is open-source and available under the [MIT License](LICENSE).
+[MIT License](LICENSE).

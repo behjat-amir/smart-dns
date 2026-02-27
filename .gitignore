@@ -2,3 +2,4 @@ build/
 .idea/
 nohup.out
 go.sum
+config.json

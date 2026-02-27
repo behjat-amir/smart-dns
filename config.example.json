@@ -1,0 +1,7 @@
+{
+  "host": "",
+  "domains": {
+    "example.com": "1.2.3.4",
+    "pub.dev": "1.2.3.4"
+  }
+}

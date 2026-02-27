@@ -183,10 +183,7 @@ install() {
         sleep 1
         clear
         echo -e "${yellow}********************${rest}"
-        read -p "Enter your domain (or press Enter to skip DoH/DoT — use only system DNS + SNI proxy): " domain
-        domain=$(echo "$domain" | xargs)
-        echo -e "${yellow}********************${rest}"
-        read -p "Enter Website names (separated by commas)[example: intel.com,youtube]: " site_list
+        read -p "Enter Website names (separated by commas)[example: intel.com,youtube,pub.dev]: " site_list
         echo -e "${yellow}********************${rest}"
         # Split the input into an array
         IFS=',' read -ra sites <<< "$site_list"
@@ -201,41 +198,14 @@ install() {
         done
         new_domains+="}"
         
-        # Create a JSON Object with host and domains (host empty = no DoH/DoT)
-        json_content="{ \"host\": \"$domain\", \"domains\": $new_domains }"
+        # host empty = only system DNS + SNI proxy (no DoH/DoT)
+        json_content="{ \"host\": \"\", \"domains\": $new_domains }"
         
         # Save JSON to config.json file
         echo "$json_content" | jq '.' > /root/smartSNI/config.json
 
         config_file="/root/smartSNI/config.json"
         sed -i "s/<YOUR_IP>/$myip/g" "$config_file"
-
-        if [ -n "$domain" ]; then
-            nginx_conf="/etc/nginx/sites-enabled/default"
-            # Minimal HTTP-only config so nginx -t passes and certbot can get the cert
-            cat > "$nginx_conf" <<NGINX_MINIMAL
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name $domain;
-    root /var/www/html;
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-}
-NGINX_MINIMAL
-            nginx -t || true
-            systemctl restart nginx || true
-            sleep 1
-            certbot --nginx -d $domain --register-unsafely-without-email --non-interactive --agree-tos --redirect
-            sed -i "s/<YOUR_HOST>/$domain/g" /root/smartSNI/nginx.conf
-            sudo cp /root/smartSNI/nginx.conf "$nginx_conf"
-            systemctl stop nginx
-            systemctl restart nginx
-        else
-            echo -e "${green}DoH/DoT skipped (no domain). Only system DNS and SNI proxy will run.${rest}"
-        fi
-        
         # Create systemd service file (runs compiled binary, no Go needed at runtime)
         cat > /etc/systemd/system/sni.service <<EOL
 [Unit]
@@ -265,11 +235,7 @@ EOL
             echo -e "${green}Service Installed Successfully and activated.${rest}"
             echo -e "${yellow}_______________________________________${rest}"
             echo ""
-            if [ -n "$domain" ]; then
-                echo -e "${cyan}DOH --> https://$domain:8443/dns-query${rest}"
-            else
-                echo -e "${cyan}System DNS (port 53) + SNI proxy (443) active. Set this server IP as your DNS.${rest}"
-            fi
+            echo -e "${cyan}System DNS (port 53) + SNI proxy (443) active. Set this server IP as your DNS.${rest}"
             echo -e "${yellow}_______________________________________${rest}"
             # Offer to install smart-dns command for next time
             if [ ! -x /usr/local/bin/smart-dns ]; then
