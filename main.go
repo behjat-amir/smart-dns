@@ -20,7 +20,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -59,6 +61,7 @@ var (
 
 	configMu   sync.RWMutex
 	configPath string
+	startTime  time.Time
 )
 
 // ======================== Config ========================
@@ -194,6 +197,28 @@ func saveConfigDomains(domains map[string]string) error {
 	return nil
 }
 
+// getServerIP returns the server's primary IPv4 (first non-loopback). Used when adding domains.
+func getServerIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok || ipNet.IP.IsLoopback() || ipNet.IP.To4() == nil {
+				continue
+			}
+			return ipNet.IP.String()
+		}
+	}
+	return ""
+}
+
 func adminLoginPage(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/admin" && r.URL.Path != "/admin/" {
 		http.NotFound(w, r)
@@ -307,9 +332,13 @@ func adminAPIDomains(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		domain := strings.TrimSpace(strings.ToLower(r.FormValue("domain")))
-		ip := strings.TrimSpace(r.FormValue("ip"))
-		if domain == "" || ip == "" {
-			http.Error(w, `{"ok":false,"error":"domain and ip required"}`, http.StatusBadRequest)
+		if domain == "" {
+			http.Error(w, `{"ok":false,"error":"domain required"}`, http.StatusBadRequest)
+			return
+		}
+		ip := getServerIP()
+		if ip == "" {
+			http.Error(w, `{"ok":false,"error":"could not determine server IP"}`, http.StatusInternalServerError)
 			return
 		}
 		configMu.RLock()
@@ -355,6 +384,112 @@ func adminAPIStatus(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"ok":true,"service":"smartSNI"}`))
 }
 
+// usageStats holds server usage for the admin dashboard.
+type usageStats struct {
+	RAMUsedMB   uint64  `json:"ram_used_mb"`
+	RAMTotalMB  uint64  `json:"ram_total_mb"`
+	RAMPercent  float64 `json:"ram_percent"`
+	CPUPercent  float64 `json:"cpu_percent"`
+	Goroutines  int     `json:"goroutines"`
+	UptimeSec   int64   `json:"uptime_sec"`
+	ProcessMB   uint64  `json:"process_mb"`
+}
+
+func readUsageStats() usageStats {
+	var u usageStats
+	u.Goroutines = runtime.NumGoroutine()
+	u.UptimeSec = int64(time.Since(startTime).Seconds())
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	u.ProcessMB = mem.Alloc / (1024 * 1024)
+	// Linux: /proc/meminfo and /proc/stat
+	totalKB, availKB := readProcMeminfo()
+	if totalKB > 0 {
+		u.RAMTotalMB = totalKB / 1024
+		usedKB := totalKB - availKB
+		if usedKB > totalKB {
+			usedKB = totalKB
+		}
+		u.RAMUsedMB = usedKB / 1024
+		u.RAMPercent = 100 * float64(usedKB) / float64(totalKB)
+	}
+	u.CPUPercent = readProcCPUPercent()
+	return u
+}
+
+func readProcMeminfo() (totalKB, availKB uint64) {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0
+	}
+	lines := strings.Split(string(b), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		val, _ := strconv.ParseUint(strings.TrimSuffix(fields[1], " kB"), 10, 64)
+		switch fields[0] {
+		case "MemTotal:":
+			totalKB = val
+		case "MemAvailable:":
+			availKB = val
+		case "MemFree:":
+			if availKB == 0 {
+				availKB = val
+			}
+		}
+	}
+	return totalKB, availKB
+}
+
+func readProcCPUPercent() float64 {
+	parseCPU := func(data []byte) (total, idle uint64) {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			if !strings.HasPrefix(line, "cpu ") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 5 {
+				return 0, 0
+			}
+			for i := 1; i < len(fields); i++ {
+				v, _ := strconv.ParseUint(fields[i], 10, 64)
+				total += v
+			}
+			idle, _ = strconv.ParseUint(fields[4], 10, 64)
+			return total, idle
+		}
+		return 0, 0
+	}
+	b0, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0
+	}
+	total0, idle0 := parseCPU(b0)
+	time.Sleep(300 * time.Millisecond)
+	b1, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0
+	}
+	total1, idle1 := parseCPU(b1)
+	dtotal := total1 - total0
+	didle := idle1 - idle0
+	if dtotal == 0 {
+		return 0
+	}
+	return 100 * (1 - float64(didle)/float64(dtotal))
+}
+
+func adminAPIUsage(w http.ResponseWriter, r *http.Request) {
+	if !adminRequireAuth(w, r) {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(readUsageStats())
+}
+
 func runAdminServer(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	mux := http.NewServeMux()
@@ -365,6 +500,7 @@ func runAdminServer(ctx context.Context, wg *sync.WaitGroup) {
 	mux.HandleFunc("/admin/logout", adminLogout)
 	mux.HandleFunc("/admin/api/domains", adminAPIDomains)
 	mux.HandleFunc("/admin/api/status", adminAPIStatus)
+	mux.HandleFunc("/admin/api/usage", adminAPIUsage)
 	srv := &http.Server{Addr: ":" + adminPort, Handler: mux, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -431,16 +567,30 @@ var adminDashboardHTML = `<!DOCTYPE html>
   </nav>
   <div class="container py-4">
     <h4 class="mb-4">Domains</h4>
-    <p class="text-muted">Added domains and their IPs. Subdomains resolve automatically.</p>
+    <p class="text-muted">Added domains use this server's IP. Subdomains resolve automatically.</p>
+    <div class="row mb-4">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header">Server usage</div>
+          <div class="card-body">
+            <div class="row g-3" id="usageRow">
+              <div class="col-md-3"><div class="border rounded p-2"><strong>RAM</strong><br><span id="ram">—</span></div></div>
+              <div class="col-md-3"><div class="border rounded p-2"><strong>CPU</strong><br><span id="cpu">—</span></div></div>
+              <div class="col-md-2"><div class="border rounded p-2"><strong>Goroutines</strong><br><span id="goroutines">—</span></div></div>
+              <div class="col-md-2"><div class="border rounded p-2"><strong>Process</strong><br><span id="process">—</span></div></div>
+              <div class="col-md-2"><div class="border rounded p-2"><strong>Uptime</strong><br><span id="uptime">—</span></div></div>
+            </div>
+            <small class="text-muted">Refreshes every 5s</small>
+          </div>
+        </div>
+      </div>
+    </div>
     <div class="card mb-4">
       <div class="card-header">Add domain</div>
       <div class="card-body">
         <form id="addForm" class="row g-2">
-          <div class="col-md-5">
+          <div class="col-md-9">
             <input type="text" name="domain" class="form-control" placeholder="Domain (e.g. example.com)" required>
-          </div>
-          <div class="col-md-4">
-            <input type="text" name="ip" class="form-control" placeholder="IP address" required>
           </div>
           <div class="col-md-3">
             <button type="submit" class="btn btn-success w-100">Add</button>
@@ -475,6 +625,23 @@ var adminDashboardHTML = `<!DOCTYPE html>
   </div>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
   <script>
+    function fmtUptime(sec) {
+      if (sec < 60) return sec + 's';
+      if (sec < 3600) return Math.floor(sec/60) + 'm';
+      if (sec < 86400) return Math.floor(sec/3600) + 'h ' + Math.floor((sec%3600)/60) + 'm';
+      return Math.floor(sec/86400) + 'd ' + Math.floor((sec%86400)/3600) + 'h';
+    }
+    function loadUsage() {
+      fetch('/admin/api/usage').then(function(r) { return r.json(); }).then(function(d) {
+        document.getElementById('ram').textContent = (d.ram_total_mb ? (d.ram_used_mb + ' / ' + d.ram_total_mb + ' MB (' + (d.ram_percent || 0).toFixed(1) + '%)') : '—');
+        document.getElementById('cpu').textContent = (typeof d.cpu_percent === 'number' ? d.cpu_percent.toFixed(1) : '—') + '%';
+        document.getElementById('goroutines').textContent = d.goroutines != null ? d.goroutines : '—';
+        document.getElementById('process').textContent = (d.process_mb || 0) + ' MB';
+        document.getElementById('uptime').textContent = fmtUptime(d.uptime_sec || 0);
+      }).catch(function() {});
+    }
+    loadUsage();
+    setInterval(loadUsage, 5000);
     document.getElementById('addForm').onsubmit = function(e) {
       e.preventDefault();
       var fd = new FormData(this);
@@ -1125,6 +1292,7 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 	config = cfg
+	startTime = time.Now()
 
 	// Admin: ensure admin.json exists (default admin/admin), then load
 	adminPath = filepath.Join(filepath.Dir(configPath), "admin.json")
