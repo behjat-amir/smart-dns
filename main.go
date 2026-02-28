@@ -79,6 +79,27 @@ func trimDot(s string) string { return strings.TrimSuffix(s, ".") }
 
 func countDots(s string) int { return strings.Count(s, ".") }
 
+// parentDomains returns parent domain names for a host, e.g. "api.cdn.example.com" -> ["cdn.example.com", "example.com"]
+func parentDomains(host string) []string {
+	h := strings.ToLower(trimDot(host))
+	if h == "" {
+		return nil
+	}
+	var out []string
+	for {
+		idx := strings.Index(h, ".")
+		if idx < 0 {
+			break
+		}
+		parent := h[idx+1:]
+		if parent != "" {
+			out = append(out, parent)
+		}
+		h = parent
+	}
+	return out
+}
+
 // Domain matcher with wildcard support: "*.example.com"
 func matches(host, pattern string) bool {
 	h := strings.ToLower(trimDot(host))
@@ -95,8 +116,16 @@ func matches(host, pattern string) bool {
 }
 
 func findValueByPattern(m map[string]string, host string) (string, bool) {
+	// 1) Exact or wildcard match (existing behavior)
 	for k, v := range m {
 		if matches(host, k) {
+			return v, true
+		}
+	}
+	// 2) Auto subdomain: if host is a subdomain of a configured domain, use that domain's IP
+	for _, parent := range parentDomains(host) {
+		if v, ok := m[parent]; ok {
+			// Only use exact key (no wildcard) so we don't double-apply *.example.com
 			return v, true
 		}
 	}
