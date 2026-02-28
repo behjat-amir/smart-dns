@@ -5,6 +5,7 @@ go 1.21.1
 require (
 	github.com/miekg/dns v1.1.57
 	github.com/valyala/fasthttp v1.51.0
+	golang.org/x/crypto v0.23.0
 	golang.org/x/time v0.4.0
 )
 

@@ -1,17 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/miekg/dns"
-	"github.com/valyala/fasthttp"
-	"golang.org/x/time/rate"
+	"html/template"
 	"io"
 	"log"
 	"net"
@@ -24,6 +25,11 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/miekg/dns"
+	"github.com/valyala/fasthttp"
+	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/time/rate"
 )
 
 // ======================== Globals ========================
@@ -50,6 +56,9 @@ var (
 		},
 	}
 	defaultTTL uint32 = 3600
+
+	configMu   sync.RWMutex
+	configPath string
 )
 
 // ======================== Config ========================
@@ -71,7 +80,422 @@ func LoadConfig(filename string) (*Config, error) {
 	return &c, nil
 }
 
-// ======================== Utilities ========================
+// ======================== Admin ========================
+
+const adminPort = "8081"
+const sessionCookie = "admin_session"
+const sessionDuration = 24 * time.Hour
+
+type AdminCreds struct {
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash"`
+}
+
+var (
+	adminPath   string
+	adminCreds  *AdminCreds
+	sessionMap  = make(map[string]sessionEntry)
+	sessionMu   sync.RWMutex
+)
+
+type sessionEntry struct {
+	username string
+	expires  time.Time
+}
+
+func loadAdminCreds(path string) (*AdminCreds, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var c AdminCreds
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, err
+	}
+	if c.Username == "" || c.PasswordHash == "" {
+		return nil, errors.New("invalid admin file")
+	}
+	return &c, nil
+}
+
+func ensureDefaultAdmin(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte("admin"), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	creds := AdminCreds{Username: "admin", PasswordHash: string(hash)}
+	b, _ := json.MarshalIndent(creds, "", "  ")
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		return err
+	}
+	log.Println("Admin: created default admin user (admin / admin). Change password after first login.")
+	return nil
+}
+
+func adminCheckPassword(username, password string) bool {
+	if adminCreds == nil {
+		return false
+	}
+	if !strings.EqualFold(adminCreds.Username, username) {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(adminCreds.PasswordHash), []byte(password)) == nil
+}
+
+func adminNewSession(username string) string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	token := hex.EncodeToString(b)
+	sessionMu.Lock()
+	sessionMap[token] = sessionEntry{username: username, expires: time.Now().Add(sessionDuration)}
+	sessionMu.Unlock()
+	return token
+}
+
+func adminGetSession(token string) (username string, ok bool) {
+	sessionMu.RLock()
+	e, ok := sessionMap[token]
+	sessionMu.RUnlock()
+	if !ok || time.Now().After(e.expires) {
+		return "", false
+	}
+	return e.username, true
+}
+
+func adminRequireAuth(w http.ResponseWriter, r *http.Request) bool {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil || c.Value == "" {
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return false
+	}
+	if _, ok := adminGetSession(c.Value); !ok {
+		http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", MaxAge: -1, Path: "/"})
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return false
+	}
+	return true
+}
+
+func saveConfigDomains(domains map[string]string) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	newCfg := &Config{Host: config.Host, Domains: domains}
+	b, err := json.MarshalIndent(newCfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(configPath, b, 0644); err != nil {
+		return err
+	}
+	config = newCfg
+	return nil
+}
+
+func adminLoginPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/admin" && r.URL.Path != "/admin/" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method == http.MethodGet {
+		c, _ := r.Cookie(sessionCookie)
+		if c != nil && c.Value != "" {
+			if _, ok := adminGetSession(c.Value); ok {
+				http.Redirect(w, r, "/admin/dashboard", http.StatusFound)
+				return
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	data := struct{ Error bool }{Error: r.URL.Query().Get("error") != ""}
+	tpl := template.Must(template.New("login").Parse(string(adminLoginHTML)))
+	tpl.Execute(w, data)
+}
+
+func adminLoginPost(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || r.URL.Path != "/admin/login" {
+		http.NotFound(w, r)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Redirect(w, r, "/admin?error=1", http.StatusFound)
+		return
+	}
+	user := strings.TrimSpace(r.FormValue("username"))
+	pass := r.FormValue("password")
+	if user == "" || pass == "" {
+		http.Redirect(w, r, "/admin?error=1", http.StatusFound)
+		return
+	}
+	if !adminCheckPassword(user, pass) {
+		http.Redirect(w, r, "/admin?error=1", http.StatusFound)
+		return
+	}
+	token := adminNewSession(user)
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", MaxAge: int(sessionDuration.Seconds()), HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	http.Redirect(w, r, "/admin/dashboard", http.StatusFound)
+}
+
+func adminDashboard(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/admin/dashboard" {
+		http.NotFound(w, r)
+		return
+	}
+	if !adminRequireAuth(w, r) {
+		return
+	}
+	configMu.RLock()
+	domains := make(map[string]string)
+	for k, v := range config.Domains {
+		domains[k] = v
+	}
+	configMu.RUnlock()
+	tpl := template.Must(template.New("dashboard").Parse(adminDashboardHTML))
+	data := struct {
+		Domains     []struct{ Domain, IP string }
+		DomainCount int
+	}{DomainCount: len(domains)}
+	for d, ip := range domains {
+		data.Domains = append(data.Domains, struct{ Domain, IP string }{d, ip})
+	}
+	for i := 0; i < len(data.Domains); i++ {
+		for j := i + 1; j < len(data.Domains); j++ {
+			if data.Domains[j].Domain < data.Domains[i].Domain {
+				data.Domains[i], data.Domains[j] = data.Domains[j], data.Domains[i]
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := tpl.Execute(w, data); err != nil {
+		log.Println("admin template:", err)
+	}
+}
+
+func adminLogout(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/admin/logout" {
+		http.NotFound(w, r)
+		return
+	}
+	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+		sessionMu.Lock()
+		delete(sessionMap, c.Value)
+		sessionMu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", MaxAge: -1, Path: "/"})
+	http.Redirect(w, r, "/admin", http.StatusFound)
+}
+
+func adminAPIDomains(w http.ResponseWriter, r *http.Request) {
+	if !adminRequireAuth(w, r) {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	configMu.RLock()
+	domains := make(map[string]string)
+	for k, v := range config.Domains {
+		domains[k] = v
+	}
+	configMu.RUnlock()
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(domains)
+	case http.MethodPost:
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, `{"ok":false,"error":"bad form"}`, http.StatusBadRequest)
+			return
+		}
+		domain := strings.TrimSpace(strings.ToLower(r.FormValue("domain")))
+		ip := strings.TrimSpace(r.FormValue("ip"))
+		if domain == "" || ip == "" {
+			http.Error(w, `{"ok":false,"error":"domain and ip required"}`, http.StatusBadRequest)
+			return
+		}
+		configMu.RLock()
+		newDomains := make(map[string]string)
+		for k, v := range config.Domains {
+			newDomains[k] = v
+		}
+		configMu.RUnlock()
+		newDomains[domain] = ip
+		if err := saveConfigDomains(newDomains); err != nil {
+			http.Error(w, `{"ok":false,"error":"save failed"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte(`{"ok":true}`))
+	case http.MethodDelete:
+		domain := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("domain")))
+		if domain == "" {
+			http.Error(w, `{"ok":false,"error":"domain required"}`, http.StatusBadRequest)
+			return
+		}
+		configMu.RLock()
+		newDomains := make(map[string]string)
+		for k, v := range config.Domains {
+			newDomains[k] = v
+		}
+		configMu.RUnlock()
+		delete(newDomains, domain)
+		if err := saveConfigDomains(newDomains); err != nil {
+			http.Error(w, `{"ok":false,"error":"save failed"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte(`{"ok":true}`))
+	default:
+		http.Error(w, "", http.StatusMethodNotAllowed)
+	}
+}
+
+func adminAPIStatus(w http.ResponseWriter, r *http.Request) {
+	if !adminRequireAuth(w, r) {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true,"service":"smartSNI"}`))
+}
+
+func runAdminServer(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/admin", adminLoginPage)
+	mux.HandleFunc("/admin/", adminLoginPage)
+	mux.HandleFunc("/admin/login", adminLoginPost)
+	mux.HandleFunc("/admin/dashboard", adminDashboard)
+	mux.HandleFunc("/admin/logout", adminLogout)
+	mux.HandleFunc("/admin/api/domains", adminAPIDomains)
+	mux.HandleFunc("/admin/api/status", adminAPIStatus)
+	srv := &http.Server{Addr: ":" + adminPort, Handler: mux, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}
+	go func() {
+		<-ctx.Done()
+		srv.Shutdown(context.Background())
+	}()
+	log.Println("Admin panel listening on http://127.0.0.1:" + adminPort + "/admin")
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Println("Admin server:", err)
+	}
+}
+
+var adminLoginHTML = []byte(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin Login – Smart SNI</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light d-flex align-items-center min-vh-100">
+  <div class="container">
+    <div class="row justify-content-center">
+      <div class="col-md-4">
+        <div class="card shadow">
+          <div class="card-body p-4">
+            <h5 class="card-title mb-4">Smart SNI – Admin</h5>
+            {{if .Error}}<div class="alert alert-danger py-2">Invalid username or password.</div>{{end}}
+            <form method="post" action="/admin/login">
+              <div class="mb-3">
+                <label class="form-label">Username</label>
+                <input type="text" name="username" class="form-control" required autofocus>
+              </div>
+              <div class="mb-3">
+                <label class="form-label">Password</label>
+                <input type="password" name="password" class="form-control" required>
+              </div>
+              <button type="submit" class="btn btn-primary w-100">Sign in</button>
+            </form>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>`)
+
+var adminDashboardHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard – Smart SNI Admin</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+  <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+    <div class="container-fluid">
+      <a class="navbar-brand" href="/admin/dashboard">Smart SNI</a>
+      <div class="navbar-nav ms-auto">
+        <a class="nav-link text-white" href="/admin/logout">Logout</a>
+      </div>
+    </div>
+  </nav>
+  <div class="container py-4">
+    <h4 class="mb-4">Domains</h4>
+    <p class="text-muted">Added domains and their IPs. Subdomains resolve automatically.</p>
+    <div class="card mb-4">
+      <div class="card-header">Add domain</div>
+      <div class="card-body">
+        <form id="addForm" class="row g-2">
+          <div class="col-md-5">
+            <input type="text" name="domain" class="form-control" placeholder="Domain (e.g. example.com)" required>
+          </div>
+          <div class="col-md-4">
+            <input type="text" name="ip" class="form-control" placeholder="IP address" required>
+          </div>
+          <div class="col-md-3">
+            <button type="submit" class="btn btn-success w-100">Add</button>
+          </div>
+        </form>
+        <div id="addMsg" class="mt-2 small"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span>Current domains</span>
+        <span class="badge bg-secondary">{{.DomainCount}}</span>
+      </div>
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table class="table table-hover mb-0">
+            <thead><tr><th>Domain</th><th>IP</th><th></th></tr></thead>
+            <tbody>
+              {{range .Domains}}
+              <tr>
+                <td><code>{{.Domain}}</code></td>
+                <td>{{.IP}}</td>
+                <td><button type="button" class="btn btn-sm btn-outline-danger remove-btn" data-domain="{{.Domain}}">Remove</button></td>
+              </tr>
+              {{end}}
+              {{if not .Domains}}<tr><td colspan="3" class="text-muted">No domains yet. Add one above.</td></tr>{{end}}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    document.getElementById('addForm').onsubmit = function(e) {
+      e.preventDefault();
+      var fd = new FormData(this);
+      var msg = document.getElementById('addMsg');
+      fetch('/admin/api/domains', { method: 'POST', body: fd }).then(function(r) {
+        if (r.ok) { msg.className = 'mt-2 small text-success'; msg.textContent = 'Added.'; location.reload(); }
+        else { msg.className = 'mt-2 small text-danger'; msg.textContent = 'Failed.'; }
+      });
+    };
+    document.querySelectorAll('.remove-btn').forEach(function(btn) {
+      btn.onclick = function() {
+        if (!confirm('Remove ' + this.dataset.domain + '?')) return;
+        var domain = encodeURIComponent(this.dataset.domain);
+        fetch('/admin/api/domains?domain=' + domain, { method: 'DELETE' }).then(function(r) {
+          if (r.ok) location.reload(); else alert('Failed.');
+        });
+      };
+    });
+  </script>
+</body>
+</html>`
 
 func isIPv4(ip net.IP) bool { return ip.To4() != nil }
 
@@ -214,7 +638,10 @@ func processDNSQuery(query []byte) ([]byte, error) {
 	}
 
 	qName := trimDot(req.Question[0].Name)
-	if ip, ok := findValueByPattern(config.Domains, qName); ok {
+	configMu.RLock()
+	domains := config.Domains
+	configMu.RUnlock()
+	if ip, ok := findValueByPattern(domains, qName); ok {
 		return buildLocalDNSResponse(&req, ip)
 	}
 
@@ -420,7 +847,10 @@ func handleConnection(clientConn net.Conn) {
 	}
 
 	target := sni
-	if config.Host != "" && target == strings.ToLower(config.Host) {
+	configMu.RLock()
+	hostCfg := config.Host
+	configMu.RUnlock()
+	if hostCfg != "" && target == strings.ToLower(hostCfg) {
 		target = "127.0.0.1:8443"
 	} else {
 		target = net.JoinHostPort(target, "443")
@@ -642,7 +1072,41 @@ func runClassicDNSServer(ctx context.Context, wg *sync.WaitGroup) {
 
 // ======================== main ========================
 
+func runSetAdminPassword() {
+	wd, _ := os.Getwd()
+	path := filepath.Join(wd, "admin.json")
+	fmt.Print("Admin username [admin]: ")
+	reader := bufio.NewReader(os.Stdin)
+	user, _ := reader.ReadString('\n')
+	user = strings.TrimSpace(user)
+	if user == "" {
+		user = "admin"
+	}
+	fmt.Print("Admin password: ")
+	pass, _ := reader.ReadString('\n')
+	pass = strings.TrimSpace(pass)
+	if pass == "" {
+		log.Fatal("Password cannot be empty")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
+	if err != nil {
+		log.Fatal(err)
+	}
+	creds := AdminCreds{Username: user, PasswordHash: string(hash)}
+	b, _ := json.MarshalIndent(creds, "", "  ")
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("Admin credentials saved to", path)
+}
+
 func main() {
+	// -set-admin-password: create/update admin.json and exit
+	if len(os.Args) >= 2 && (os.Args[1] == "-set-admin-password" || os.Args[1] == "--set-admin-password") {
+		runSetAdminPassword()
+		return
+	}
+
 	// Effective GC tuning at runtime (unlike setting env var)
 	debug.SetGCPercent(50)
 
@@ -651,11 +1115,27 @@ func main() {
 		dohURL = v
 	}
 
-	cfg, err := LoadConfig("config.json")
+	cfgPath, err := filepath.Abs("config.json")
+	if err != nil {
+		cfgPath = "config.json"
+	}
+	configPath = cfgPath
+	cfg, err := LoadConfig(configPath)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 	config = cfg
+
+	// Admin: ensure admin.json exists (default admin/admin), then load
+	adminPath = filepath.Join(filepath.Dir(configPath), "admin.json")
+	if err := ensureDefaultAdmin(adminPath); err != nil {
+		log.Printf("Admin: could not ensure default admin: %v", err)
+	} else {
+		adminCreds, err = loadAdminCreds(adminPath)
+		if err != nil {
+			log.Printf("Admin: could not load credentials: %v", err)
+		}
+	}
 
 	// Shared rate limiter for DoH/DoT (50 req/s, burst 100)
 	limiter = rate.NewLimiter(rate.Limit(50), 100)
@@ -678,6 +1158,10 @@ func main() {
 		wg.Add(2)
 		go runDOHServer(ctx, &wg)
 		go startDoTServer(ctx, &wg)
+	}
+	if adminCreds != nil {
+		wg.Add(1)
+		go runAdminServer(ctx, &wg)
 	}
 
 	wg.Wait()

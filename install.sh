@@ -43,6 +43,7 @@ open_firewall_ports() {
             ufw allow 443/tcp 2>/dev/null
             ufw allow 853/tcp 2>/dev/null
             ufw allow 8443/tcp 2>/dev/null
+            ufw allow 8081/tcp 2>/dev/null
             ufw reload 2>/dev/null
             echo -e "${green}Ports opened in UFW.${rest}"
         else
@@ -59,6 +60,7 @@ open_firewall_ports() {
         firewall-cmd --permanent --add-port=443/tcp 2>/dev/null
         firewall-cmd --permanent --add-port=853/tcp 2>/dev/null
         firewall-cmd --permanent --add-port=8443/tcp 2>/dev/null
+        firewall-cmd --permanent --add-port=8081/tcp 2>/dev/null
         firewall-cmd --reload 2>/dev/null
         echo -e "${green}Ports opened in firewalld.${rest}"
         return
@@ -66,7 +68,7 @@ open_firewall_ports() {
     # iptables: add rules if iptables is in use (no -F, just append)
     if command -v iptables &> /dev/null; then
         echo -e "${yellow}Adding iptables rules for smartSNI ports.${rest}"
-        for port in 53 80 443 853 8443; do
+        for port in 53 80 443 853 8443 8081; do
             iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null
             [ "$port" = "53" ] && ( iptables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null )
         done
@@ -236,6 +238,7 @@ EOL
             echo -e "${yellow}_______________________________________${rest}"
             echo ""
             echo -e "${cyan}System DNS (port 53) + SNI proxy (443) active. Set this server IP as your DNS.${rest}"
+            echo -e "${cyan}Admin panel: http://$myip:8081/admin — default login: admin / admin (change after first login)${rest}"
             echo -e "${yellow}_______________________________________${rest}"
             # Offer to install smart-dns command for next time
             if [ ! -x /usr/local/bin/smart-dns ]; then
@@ -283,9 +286,7 @@ display_sites() {
 
     if [ -d "/root/smartSNI" ]; then
         echo -e "${yellow}****${cyan} [Websites] ${yellow}****${rest}"
-        # Initialize a counter
         counter=1
-        # Loop through the domains and display with numbering
         jq -r '.domains | keys_unsorted | .[]' "$config_file" | while read -r domain; do
             echo "$counter) $domain"
             ((counter++))
@@ -348,6 +349,33 @@ upgrade_smart_dns() {
     else
         echo -e "${red}Build OK but sni.service not active. Check: journalctl -u sni.service -n 30${rest}"
     fi
+}
+
+# Show Admin Panel URL and login info
+show_admin_panel_info() {
+    if [ ! -d "/root/smartSNI" ] || [ ! -f "/root/smartSNI/smartSNI" ]; then
+        echo -e "${red}smartSNI is not installed. Install first.${rest}"
+        return
+    fi
+    myip=$(hostname -I | awk '{print $1}')
+    echo -e "${yellow}********************${rest}"
+    echo -e "${cyan}Admin panel:${rest} http://$myip:8081/admin"
+    echo -e "${cyan}Default login:${rest} admin / admin (change via option 9 or in panel)${rest}"
+    echo -e "${yellow}********************${rest}"
+}
+
+# Set admin password (run binary with -set-admin-password)
+set_admin_password() {
+    if [ ! -f "/root/smartSNI/smartSNI" ]; then
+        echo -e "${red}smartSNI is not installed. Install first.${rest}"
+        return
+    fi
+    echo -e "${yellow}Set admin username and password (saved to /root/smartSNI/admin.json).${rest}"
+    cd /root/smartSNI || return 1
+    ./smartSNI -set-admin-password
+    echo -e "${green}Done. Restarting service to load new credentials...${rest}"
+    systemctl restart sni.service 2>/dev/null
+    echo -e "${green}Done.${rest}"
 }
 
 # Add sites
@@ -492,6 +520,10 @@ echo -e "${yellow}6] ${green}Fix port 53 & restart${rest} ${purple}*"
 echo -e "${purple}                  * "
 echo -e "${yellow}7] ${green}Upgrade${rest} (pull + rebuild + restart) ${purple}*"
 echo -e "${purple}                  * "
+echo -e "${yellow}8] ${green}Admin Panel${rest} (show URL and login info) ${purple}*"
+echo -e "${purple}                  * "
+echo -e "${yellow}9] ${green}Set admin password${rest} ${purple}*"
+echo -e "${purple}                  * "
 echo -e "${red}0${yellow}] ${purple}Exit${rest}${purple}           *"
 echo -e "${purple}*******************${rest}"
 read -p "Enter your choice: " choice
@@ -516,6 +548,12 @@ case "$choice" in
         ;;
     7)
         upgrade_smart_dns
+        ;;
+    8)
+        show_admin_panel_info
+        ;;
+    9)
+        set_admin_password
         ;;
     0)
         echo -e "${cyan}By 🖐${rest}"
